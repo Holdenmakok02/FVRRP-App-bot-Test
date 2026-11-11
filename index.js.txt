@@ -1,0 +1,666 @@
+require('dotenv').config();
+
+const sqlite3 = require('sqlite3').verbose();
+const {
+    Client,
+    GatewayIntentBits,
+    ChannelType,
+    PermissionFlagsBits,
+    EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle,
+    MessageFlags,
+    RoleSelectMenuBuilder,
+    ChannelSelectMenuBuilder
+} = require('discord.js');
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages
+    ]
+});
+
+const db = new sqlite3.Database('./data.sqlite');
+
+// ==========================================
+// DATABASE SETUP
+// ==========================================
+db.serialize(() => {
+    db.run(`
+        CREATE TABLE IF NOT EXISTS settings (
+            guild_id TEXT PRIMARY KEY,
+            category_id TEXT,
+            log_channel_id TEXT,
+            staff_roles TEXT,
+            application_rules TEXT,
+            application_questions TEXT,
+            panel_message TEXT,
+            approval_message TEXT,
+            denial_message TEXT
+        )
+    `);
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            channel_id TEXT,
+            reviewer_id TEXT,
+            status TEXT,
+            denial_reason TEXT,
+            reviewed_at INTEGER
+        )
+    `);
+});
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
+function getSettings(guildId) {
+    return new Promise((resolve, reject) => {
+        db.get(`SELECT * FROM settings WHERE guild_id=?`, [guildId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+function getApplication(id) {
+    return new Promise((resolve, reject) => {
+        db.get(`SELECT * FROM applications WHERE id=?`, [id], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+function getActiveApplication(userId) {
+    return new Promise((resolve, reject) => {
+        db.get(`SELECT * FROM applications WHERE user_id=? AND status='PENDING'`, [userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+function isStaff(member, settings) {
+    if (!settings || !settings.staff_roles) return false;
+    try {
+        const roles = JSON.parse(settings.staff_roles);
+        return roles.some(roleId => member.roles.cache.has(roleId));
+    } catch {
+        return false;
+    }
+}
+
+function hasAdminPermission(member) {
+    return member && member.permissions && member.permissions.has(PermissionFlagsBits.Administrator);
+}
+
+function logTranscript(guild, settings, applicationId, applicantId, reviewerId, decision, reason = null) {
+    if (!settings || !settings.log_channel_id) return;
+    const channel = guild.channels.cache.get(settings.log_channel_id);
+    if (!channel) return;
+
+    const embed = new EmbedBuilder()
+        .setColor(decision === 'APPROVED' ? '#57F287' : '#ED4245')
+        .setTitle('📄 Application Transcript')
+        .addFields(
+            { name: 'Application Number', value: `#${String(applicationId).padStart(4, '0')}`, inline: false },
+            { name: 'Applicant', value: `<@${applicantId}>`, inline: false },
+            { name: 'Reviewed By', value: `<@${reviewerId}>`, inline: false },
+            { name: 'Decision', value: `**${decision}**`, inline: false }
+        )
+        .setTimestamp();
+
+    if (reason) {
+        embed.addFields({ name: 'Reason for Denial', value: reason, inline: false });
+    }
+
+    channel.send({ embeds: [embed] }).catch(() => {});
+}
+
+function scheduleAutoClose(channel, days = 7) {
+    const ms = days * 24 * 60 * 60 * 1000;
+    setTimeout(async () => {
+        await channel.delete().catch(() => {});
+    }, ms);
+}
+
+// ==========================================
+// STARTUP CLEANUP
+// ==========================================
+client.once('clientReady', async () => {
+    console.log(`Logged in as ${client.user.tag}`);
+
+    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    
+    db.all(`SELECT * FROM applications WHERE status IN ('APPROVED', 'DENIED') AND reviewed_at IS NOT NULL AND reviewed_at < ?`, [sevenDaysAgo], async (err, rows) => {
+        if (err || !rows) return;
+        
+        for (const app of rows) {
+            if (app.channel_id) {
+                const channel = client.channels.cache.get(app.channel_id);
+                if (channel) {
+                    await channel.delete().catch(() => {});
+                    console.log(`Auto-closed old application #${app.id} on startup.`);
+                }
+            }
+        }
+    });
+});
+
+// ==========================================
+// UI BUILDERS
+// ==========================================
+function buildStep1() {
+    const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('Step 1: Channel Configuration')
+        .setDescription('Please select the **Category** where application channels will be created, and the **Logs Channel** where transcripts will be saved.\n\nUse the menus below.');
+
+    const catSelect = new ChannelSelectMenuBuilder()
+        .setCustomId('select_category')
+        .setPlaceholder('Select Application Category')
+        .setChannelTypes([ChannelType.GuildCategory]);
+
+    const logSelect = new ChannelSelectMenuBuilder()
+        .setCustomId('select_logs')
+        .setPlaceholder('Select Transcripts Log Channel')
+        .setChannelTypes([ChannelType.GuildText]);
+
+    const row1 = new ActionRowBuilder().addComponents(catSelect);
+    const row2 = new ActionRowBuilder().addComponents(logSelect);
+    const row3 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('step1_next').setLabel('Next').setStyle(ButtonStyle.Primary)
+    );
+
+    return { embeds: [embed], components: [row1, row2, row3] };
+}
+
+function buildStep2() {
+    const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('Step 2: Application Rules')
+        .setDescription('Please enter the **Application Rules**. These are the guidelines applicants must follow (e.g., "Be respectful", "Provide accurate information").\n\nClick the button below to open the text editor.');
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('back_to_step1').setLabel('Back').setStyle(ButtonStyle.Secondary).setEmoji('⬅️'),
+        new ButtonBuilder().setCustomId('edit_rules').setLabel('Edit Rules').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('step2_next').setLabel('Next').setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [row] };
+}
+
+function buildStep3() {
+    const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('Step 3: Application Questions')
+        .setDescription('Please enter the **Application Questions**. These are the questions the applicant must answer in their ticket (e.g., "What is your age?", "Why do you want to join?").\n\nClick the button below to open the text editor.');
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('back_to_step2').setLabel('Back').setStyle(ButtonStyle.Secondary).setEmoji('⬅️'),
+        new ButtonBuilder().setCustomId('edit_questions').setLabel('Edit Questions').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('step3_next').setLabel('Next').setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [row] };
+}
+
+function buildStep4() {
+    const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('Step 4: Staff Roles')
+        .setDescription('Select the roles that should have access to review applications and view transcripts.\n\nUse the dropdown to select your staff roles.');
+
+    const roleSelect = new RoleSelectMenuBuilder()
+        .setCustomId('select_staff_roles')
+        .setPlaceholder('Select Staff Roles')
+        .setMinValues(1)
+        .setMaxValues(5);
+
+    const row1 = new ActionRowBuilder().addComponents(roleSelect);
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('back_to_step3').setLabel('Back').setStyle(ButtonStyle.Secondary).setEmoji('⬅️'),
+        new ButtonBuilder().setCustomId('step4_next').setLabel('Next').setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [row1, row2] };
+}
+
+function buildStep5() {
+    const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('Step 5: Approval & Denial Messages')
+        .setDescription('Please set the messages that will be sent to the applicant when their application is reviewed.\n\n**Best Practice:** Use this space to let the applicant know what their next steps are (e.g., "Join the server", "Wait for a ping from staff").\n\nUse the buttons below to edit them.');
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('back_to_step4').setLabel('Back').setStyle(ButtonStyle.Secondary).setEmoji('⬅️'),
+        new ButtonBuilder().setCustomId('edit_approval').setLabel('Edit Approval Message').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('edit_denial').setLabel('Edit Denial Message').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('step5_next').setLabel('Next').setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [row] };
+}
+
+function buildStep6() {
+    const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('Step 6: Application Panel Description')
+        .setDescription('Finally, set the description that will appear on the panel where users click to apply.\n\nThis is what users will see **before** making a ticket, so it should be clear, welcoming, and showcase what they are applying to.\n\nClick the button below to open the text editor.');
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('back_to_step5').setLabel('Back').setStyle(ButtonStyle.Secondary).setEmoji('⬅️'),
+        new ButtonBuilder().setCustomId('edit_panel').setLabel('Edit Panel Description').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('step6_finish').setLabel('Finish Setup').setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [row] };
+}
+
+// ==========================================
+// INTERACTION HANDLER
+// ==========================================
+client.on('interactionCreate', async interaction => {
+    try {
+        // ==========================================
+        // /DASHBOARD COMMAND
+        // ==========================================
+        if (interaction.isChatInputCommand() && interaction.commandName === 'dashboard') {
+            if (!hasAdminPermission(interaction.member)) {
+                return interaction.reply({ 
+                    content: '❌ You need **Administrator** powers to use this command.', 
+                    flags: MessageFlags.Ephemeral 
+                });
+            }
+
+            // Defer the reply immediately to prevent 10062 timeout errors
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            return interaction.editReply(buildStep1());
+        }
+
+        // ==========================================
+        // /DEPLOY COMMAND
+        // ==========================================
+        if (interaction.isChatInputCommand() && interaction.commandName === 'deploy') {
+            if (!hasAdminPermission(interaction.member)) {
+                return interaction.reply({ 
+                    content: '❌ You need **Administrator** powers to use this command.', 
+                    flags: MessageFlags.Ephemeral 
+                });
+            }
+
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const settings = await getSettings(interaction.guild.id);
+            
+            if (!settings) {
+                return interaction.editReply({ content: '❌ No configuration found. Please run `/dashboard` and complete all steps.' });
+            }
+            if (!settings.category_id) {
+                return interaction.editReply({ content: '❌ Missing Category setup. Please run `/dashboard`.' });
+            }
+            if (!settings.application_rules) {
+                return interaction.editReply({ content: '❌ Missing Application Rules. Please run `/dashboard`.' });
+            }
+            if (!settings.application_questions) {
+                return interaction.editReply({ content: '❌ Missing Application Questions. Please run `/dashboard`.' });
+            }
+
+            const embed = new EmbedBuilder()
+                .setColor('#5865F2')
+                .setTitle('📝 Application Form')
+                .setDescription(settings.panel_message || 'Click the button below to apply.')
+                .setFooter({ text: interaction.guild.name, iconURL: interaction.guild.iconURL() });
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('apply').setLabel('Apply Now').setStyle(ButtonStyle.Primary).setEmoji('📩')
+            );
+
+            await interaction.channel.send({ embeds: [embed], components: [row] });
+            return interaction.editReply({ content: '✅ Application panel deployed.' });
+        }
+
+        // ==========================================
+        // WIZARD BUTTONS & NAVIGATION
+        // ==========================================
+        if (interaction.isButton()) {
+            // Forward Navigation
+            if (interaction.customId === 'step1_next') return interaction.update(buildStep2());
+            if (interaction.customId === 'step2_next') return interaction.update(buildStep3());
+            if (interaction.customId === 'step3_next') return interaction.update(buildStep4());
+            if (interaction.customId === 'step4_next') return interaction.update(buildStep5());
+            if (interaction.customId === 'step5_next') return interaction.update(buildStep6());
+            
+            // Backward Navigation
+            if (interaction.customId === 'back_to_step1') return interaction.update(buildStep1());
+            if (interaction.customId === 'back_to_step2') return interaction.update(buildStep2());
+            if (interaction.customId === 'back_to_step3') return interaction.update(buildStep3());
+            if (interaction.customId === 'back_to_step4') return interaction.update(buildStep4());
+            if (interaction.customId === 'back_to_step5') return interaction.update(buildStep5());
+            
+            // Finish
+            if (interaction.customId === 'step6_finish') {
+                return interaction.update({ 
+                    content: '✅ **Setup Complete!** Your application system is now fully configured. Use `/deploy` in the channel where you want the application panel to appear.', 
+                    embeds: [], 
+                    components: [] 
+                });
+            }
+
+            // Edit Modals
+            if (interaction.customId === 'edit_rules') {
+                const settings = await getSettings(interaction.guild.id) || {};
+                const modal = new ModalBuilder().setCustomId('modal_rules').setTitle('Edit Application Rules');
+                const textInput = new TextInputBuilder()
+                    .setCustomId('rules_text')
+                    .setLabel('Application Rules')
+                    .setStyle(TextInputStyle.Paragraph)
+                    .setRequired(true)
+                    .setValue(settings.application_rules || '1. Be respectful.\n2. Provide accurate information.');
+                modal.addComponents(new ActionRowBuilder().addComponents(textInput));
+                return interaction.showModal(modal);
+            }
+
+            if (interaction.customId === 'edit_questions') {
+                const settings = await getSettings(interaction.guild.id) || {};
+                const modal = new ModalBuilder().setCustomId('modal_questions').setTitle('Edit Application Questions');
+                const textInput = new TextInputBuilder()
+                    .setCustomId('questions_text')
+                    .setLabel('Questions to Answer')
+                    .setStyle(TextInputStyle.Paragraph)
+                    .setRequired(true)
+                    .setValue(settings.application_questions || '1. What is your age?\n2. Why do you want to join?');
+                modal.addComponents(new ActionRowBuilder().addComponents(textInput));
+                return interaction.showModal(modal);
+            }
+
+            if (interaction.customId === 'edit_approval') {
+                const settings = await getSettings(interaction.guild.id) || {};
+                const modal = new ModalBuilder().setCustomId('modal_approval').setTitle('Edit Approval Message');
+                const textInput = new TextInputBuilder()
+                    .setCustomId('approval_text')
+                    .setLabel('Approval Message')
+                    .setStyle(TextInputStyle.Paragraph)
+                    .setRequired(true)
+                    .setValue(settings.approval_message || 'Congratulations! Your application has been **approved**.');
+                modal.addComponents(new ActionRowBuilder().addComponents(textInput));
+                return interaction.showModal(modal);
+            }
+
+            if (interaction.customId === 'edit_denial') {
+                const settings = await getSettings(interaction.guild.id) || {};
+                const modal = new ModalBuilder().setCustomId('modal_denial').setTitle('Edit Denial Message');
+                const textInput = new TextInputBuilder()
+                    .setCustomId('denial_text')
+                    .setLabel('Denial Message')
+                    .setStyle(TextInputStyle.Paragraph)
+                    .setRequired(true)
+                    .setValue(settings.denial_message || 'We regret to inform you that your application has been **denied**.');
+                modal.addComponents(new ActionRowBuilder().addComponents(textInput));
+                return interaction.showModal(modal);
+            }
+
+            if (interaction.customId === 'edit_panel') {
+                const settings = await getSettings(interaction.guild.id) || {};
+                const modal = new ModalBuilder().setCustomId('modal_panel').setTitle('Edit Panel Description');
+                const textInput = new TextInputBuilder()
+                    .setCustomId('panel_text')
+                    .setLabel('Panel Description')
+                    .setStyle(TextInputStyle.Paragraph)
+                    .setRequired(true)
+                    .setValue(settings.panel_message || 'Welcome! Click the button below to apply.');
+                modal.addComponents(new ActionRowBuilder().addComponents(textInput));
+                return interaction.showModal(modal);
+            }
+        }
+
+        // ==========================================
+        // CHANNEL SELECT MENUS (Step 1)
+        // ==========================================
+        if (interaction.isChannelSelectMenu()) {
+            const settings = await getSettings(interaction.guild.id) || {};
+            const selectedId = interaction.values[0];
+
+            if (interaction.customId === 'select_category') {
+                if (settings.guild_id) {
+                    db.run(`UPDATE settings SET category_id=? WHERE guild_id=?`, [selectedId, interaction.guild.id]);
+                } else {
+                    db.run(`INSERT INTO settings (guild_id, category_id, log_channel_id, staff_roles, application_rules, application_questions, panel_message, approval_message, denial_message) VALUES (?, ?, '', '', '', '', '', '', '')`, [interaction.guild.id, selectedId]);
+                }
+                return interaction.reply({ content: `✅ Category set to <#${selectedId}>.`, flags: MessageFlags.Ephemeral });
+            }
+
+            if (interaction.customId === 'select_logs') {
+                db.run(`UPDATE settings SET log_channel_id=? WHERE guild_id=?`, [selectedId, interaction.guild.id]);
+                return interaction.reply({ content: `✅ Logs channel set to <#${selectedId}>.`, flags: MessageFlags.Ephemeral });
+            }
+        }
+
+        // ==========================================
+        // ROLE SELECT MENU (Step 4)
+        // ==========================================
+        if (interaction.isRoleSelectMenu() && interaction.customId === 'select_staff_roles') {
+            const selectedValues = interaction.values;
+            db.run(`UPDATE settings SET staff_roles=? WHERE guild_id=?`, [JSON.stringify(selectedValues), interaction.guild.id]);
+            return interaction.reply({ content: '✅ Staff roles updated successfully.', flags: MessageFlags.Ephemeral });
+        }
+
+        // ==========================================
+        // MODAL SUBMISSIONS
+        // ==========================================
+        if (interaction.isModalSubmit()) {
+            const settings = await getSettings(interaction.guild.id) || {};
+
+            if (interaction.customId === 'modal_rules') {
+                const text = interaction.fields.getTextInputValue('rules_text');
+                db.run(`UPDATE settings SET application_rules=? WHERE guild_id=?`, [text, interaction.guild.id]);
+                return interaction.reply({ content: '✅ Application rules updated!', flags: MessageFlags.Ephemeral });
+            }
+
+            if (interaction.customId === 'modal_questions') {
+                const text = interaction.fields.getTextInputValue('questions_text');
+                db.run(`UPDATE settings SET application_questions=? WHERE guild_id=?`, [text, interaction.guild.id]);
+                return interaction.reply({ content: '✅ Application questions updated!', flags: MessageFlags.Ephemeral });
+            }
+
+            if (interaction.customId === 'modal_approval') {
+                const text = interaction.fields.getTextInputValue('approval_text');
+                db.run(`UPDATE settings SET approval_message=? WHERE guild_id=?`, [text, interaction.guild.id]);
+                return interaction.reply({ content: '✅ Approval message updated!', flags: MessageFlags.Ephemeral });
+            }
+
+            if (interaction.customId === 'modal_denial') {
+                const text = interaction.fields.getTextInputValue('denial_text');
+                db.run(`UPDATE settings SET denial_message=? WHERE guild_id=?`, [text, interaction.guild.id]);
+                return interaction.reply({ content: '✅ Denial message updated!', flags: MessageFlags.Ephemeral });
+            }
+
+            if (interaction.customId === 'modal_panel') {
+                const text = interaction.fields.getTextInputValue('panel_text');
+                db.run(`UPDATE settings SET panel_message=? WHERE guild_id=?`, [text, interaction.guild.id]);
+                return interaction.reply({ content: '✅ Panel description updated!', flags: MessageFlags.Ephemeral });
+            }
+
+            // Denial reason modal
+            if (interaction.customId.startsWith('deny_')) {
+                const applicationId = interaction.customId.split('_')[1];
+                const reason = interaction.fields.getTextInputValue('reason');
+                const application = await getApplication(applicationId);
+
+                if (application.status === 'APPROVED' || application.status === 'DENIED') {
+                    return interaction.reply({ content: '❌ This application has already been reviewed.', flags: MessageFlags.Ephemeral });
+                }
+
+                const now = Date.now();
+                db.run(`UPDATE applications SET status='DENIED', reviewer_id=?, denial_reason=?, reviewed_at=? WHERE id=?`, [interaction.user.id, reason, now, applicationId]);
+                await interaction.channel.setName(`🔴-denied-${String(applicationId).padStart(4,'0')}`);
+                
+                logTranscript(interaction.guild, settings, applicationId, application.user_id, interaction.user.id, 'DENIED', reason);
+
+                const denialEmbed = new EmbedBuilder()
+                    .setColor('#ED4245')
+                    .setTitle('❌ Application Denied')
+                    .setDescription(`<@${application.user_id}>\n\n**Reason:** ${reason}\n\n${settings.denial_message || 'We regret to inform you that your application has been denied.'}\n\n*Please close this ticket using the button below once you have read this.*`);
+                
+                const closeRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`close_${applicationId}`).setLabel('Close Application').setStyle(ButtonStyle.Danger)
+                );
+
+                await interaction.channel.send({ embeds: [denialEmbed], components: [closeRow] });
+                scheduleAutoClose(interaction.channel);
+
+                return interaction.reply({ content: 'Application denied.', flags: MessageFlags.Ephemeral });
+            }
+        }
+
+        // ==========================================
+        // APPLICATION LOGIC (APPLY, APPROVE, ETC.)
+        // ==========================================
+        if (interaction.isButton() && interaction.customId === 'apply') {
+            const settings = await getSettings(interaction.guild.id);
+            
+            if (!settings || !settings.category_id) {
+                return interaction.reply({ content: 'System is currently misconfigured.', flags: MessageFlags.Ephemeral });
+            }
+
+            // DUPLICATE PREVENTION
+            const activeApp = await getActiveApplication(interaction.user.id);
+            if (activeApp) {
+                return interaction.reply({ 
+                    content: '❌ You already have an open application. Please wait for it to be reviewed before submitting another.', 
+                    flags: MessageFlags.Ephemeral 
+                });
+            }
+
+            db.run(`INSERT INTO applications (user_id, status) VALUES (?, 'PENDING')`, [interaction.user.id], async function () {
+                const applicationId = this.lastID;
+
+                const channel = await interaction.guild.channels.create({
+                    name: `🟡-application-${String(applicationId).padStart(4, '0')}`,
+                    type: ChannelType.GuildText,
+                    parent: settings.category_id,
+                    permissionOverwrites: [
+                        { id: interaction.guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+                        { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
+                        ...JSON.parse(settings.staff_roles || '[]').map(roleId => ({
+                            id: roleId,
+                            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
+                        }))
+                    ]
+                });
+
+                db.run(`UPDATE applications SET channel_id=? WHERE id=?`, [channel.id, applicationId]);
+
+                const mergedEmbed = new EmbedBuilder()
+                    .setColor('#FEE75C')
+                    .setTitle('📝 Application Received')
+                    .setDescription(
+                        `Thank you for applying, <@${interaction.user.id}>.\n\n` +
+                        `**📜 Application Rules:**\n${settings.application_rules || 'No rules provided.'}\n\n` +
+                        `**Answer the Questions below as best you can:**\n${settings.application_questions || 'No questions provided.'}`
+                    )
+                    .setTimestamp();
+
+                const applicantRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`close_${applicationId}`).setLabel('Close Application').setStyle(ButtonStyle.Danger)
+                );
+
+                const staffRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`claim_${applicationId}`).setLabel('Claim').setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder().setCustomId(`approve_${applicationId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId(`deny_${applicationId}`).setLabel('Deny').setStyle(ButtonStyle.Danger)
+                );
+
+                await channel.send({ content: `<@${interaction.user.id}>`, embeds: [mergedEmbed] });
+                await channel.send({ embeds: [new EmbedBuilder().setColor('#2b2d31').setTitle('🛡️ Staff Controls').setDescription('Use the buttons below to manage this application.')], components: [staffRow] });
+                await channel.send({ components: [applicantRow] });
+
+                await interaction.reply({ content: `✅ Application created: ${channel}`, flags: MessageFlags.Ephemeral });
+            });
+            return;
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('claim_')) {
+            const settings = await getSettings(interaction.guild.id);
+            if (!isStaff(interaction.member, settings)) return interaction.reply({ content: 'Only staff can do that.', flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: `📌 Claimed by ${interaction.user}` });
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('approve_')) {
+            const settings = await getSettings(interaction.guild.id);
+            if (!isStaff(interaction.member, settings)) return interaction.reply({ content: 'Only staff can do that.', flags: MessageFlags.Ephemeral });
+
+            const applicationId = interaction.customId.split('_')[1];
+            const application = await getApplication(applicationId);
+
+            if (application.status === 'APPROVED' || application.status === 'DENIED') {
+                return interaction.reply({ content: '❌ This application has already been reviewed.', flags: MessageFlags.Ephemeral });
+            }
+
+            const now = Date.now();
+            db.run(`UPDATE applications SET status='APPROVED', reviewer_id=?, reviewed_at=? WHERE id=?`, [interaction.user.id, now, applicationId]);
+            await interaction.channel.setName(`🟢-approved-${String(applicationId).padStart(4,'0')}`);
+            
+            logTranscript(interaction.guild, settings, applicationId, application.user_id, interaction.user.id, 'APPROVED');
+
+            const approvalEmbed = new EmbedBuilder()
+                .setColor('#57F287')
+                .setTitle('✅ Application Approved')
+                .setDescription(`<@${application.user_id}>\n\n${settings.approval_message || 'Congratulations! Your application has been approved.'}\n\n*Please close this ticket using the button below once you have read this.*`);
+            
+            const closeRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`close_${applicationId}`).setLabel('Close Application').setStyle(ButtonStyle.Danger)
+            );
+
+            await interaction.channel.send({ embeds: [approvalEmbed], components: [closeRow] });
+            scheduleAutoClose(interaction.channel);
+
+            return interaction.reply({ content: '✅ Application approved.', flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('deny_')) {
+            const settings = await getSettings(interaction.guild.id);
+            if (!isStaff(interaction.member, settings)) return interaction.reply({ content: 'Only staff can do that.', flags: MessageFlags.Ephemeral });
+
+            const modal = new ModalBuilder().setCustomId(interaction.customId).setTitle('Deny Application');
+            const reason = new TextInputBuilder().setCustomId('reason').setLabel('Reason for Denial').setStyle(TextInputStyle.Paragraph).setRequired(true);
+            modal.addComponents(new ActionRowBuilder().addComponents(reason));
+            return interaction.showModal(modal);
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('close_')) {
+            const applicationId = interaction.customId.split('_')[1];
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`confirmclose_${applicationId}`).setLabel('Confirm Close').setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId(`cancelclose_${applicationId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+            );
+            return interaction.reply({ content: 'Are you sure you want to close this application?', components: [row], flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('cancelclose_')) {
+            return interaction.reply({ content: 'Cancelled.', flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('confirmclose_')) {
+            await interaction.reply({ content: 'Channel will close in 5 seconds.', flags: MessageFlags.Ephemeral });
+            setTimeout(async () => { await interaction.channel.delete().catch(() => {}); }, 5000);
+            return;
+        }
+
+    } catch (error) {
+        console.error(error);
+        // Fallback to prevent crash
+        if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+            interaction.reply({ content: 'An error occurred.', flags: MessageFlags.Ephemeral }).catch(() => {});
+        }
+    }
+});
+
+client.login(process.env.TOKEN);
