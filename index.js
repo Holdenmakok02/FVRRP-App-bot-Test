@@ -25,7 +25,7 @@ const client = new Client({
     ]
 });
 
-const db = new sqlite3.Database('./data.sqlite');
+const db = new sqlite3.Database('/data/data.sqlite');
 
 // ==========================================
 // DATABASE SETUP
