@@ -19,8 +19,13 @@ const commands = [
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder()
         .setName('purge')
-        .setDescription('Force close all completed application channels (does not delete database records)')
+        .setDescription('Force close all completed application channels created by the bot')
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder()
+        .setName('reset')
+        .setDescription('Clear a user\'s pending application so they can reapply')
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addUserOption(option => option.setName('user').setDescription('The user to reset').setRequired(true)),
     new SlashCommandBuilder()
         .setName('config')
         .setDescription('View the current bot configuration for this server')

@@ -26,11 +26,18 @@ const client = new Client({
     ]
 });
 
-const db = new sqlite3.Database('./data.sqlite'); 
+// ==========================================
+// DATABASE SETUP (Railway Volume Fix)
+// ==========================================
+// IMPORTANT: If your config resets on Railway, it means your Volume is not mounted correctly.
+// Go to Railway -> Variables and add DB_PATH = /data/data.sqlite
+// Then make sure you have a Volume mounted to /data in your Railway settings.
+const dbPath = process.env.DB_PATH || './data.sqlite';
+const db = new sqlite3.Database(dbPath, (err) => {
+    if (err) console.error('Error opening database:', err);
+    else console.log(`📁 Connected to SQLite database at: ${dbPath}`);
+});
 
-// ==========================================
-// DATABASE SETUP
-// ==========================================
 db.serialize(() => {
     db.run(`
         CREATE TABLE IF NOT EXISTS settings (
@@ -49,6 +56,7 @@ db.serialize(() => {
     db.run(`
         CREATE TABLE IF NOT EXISTS applications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_app_number INTEGER,
             guild_id TEXT,
             user_id TEXT,
             channel_id TEXT,
@@ -58,6 +66,8 @@ db.serialize(() => {
             reviewed_at INTEGER
         )
     `);
+
+    db.run(`ALTER TABLE applications ADD COLUMN guild_app_number INTEGER`, (err) => {});
 });
 
 // ==========================================
@@ -100,16 +110,22 @@ function isStaff(member, settings) {
     }
 }
 
-function logTranscript(guild, settings, applicationId, applicantId, reviewerId, decision, reason = null) {
+function logTranscript(guild, settings, appNumber, applicantId, reviewerId, decision, reason = null) {
     if (!settings || !settings.log_channel_id) return;
     const channel = guild.channels.cache.get(settings.log_channel_id);
     if (!channel) return;
+
+    const botMember = guild.members.me;
+    if (botMember && !channel.permissionsFor(botMember)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+        console.log(`[WARNING] Missing permissions to log transcript in #${channel.name}`);
+        return;
+    }
 
     const embed = new EmbedBuilder()
         .setColor(decision === 'APPROVED' ? '#57F287' : '#ED4245')
         .setTitle('📄 Application Decision Transcript')
         .addFields(
-            { name: 'Application Number', value: `#${String(applicationId).padStart(4, '0')}`, inline: false },
+            { name: 'Application Number', value: `#${String(appNumber).padStart(4, '0')}`, inline: false },
             { name: 'Applicant', value: `<@${applicantId}>`, inline: false },
             { name: 'Reviewed By', value: `<@${reviewerId}>`, inline: false },
             { name: 'Decision', value: `**${decision}**`, inline: false }
@@ -156,7 +172,7 @@ client.once('clientReady', async () => {
                 const channel = client.channels.cache.get(app.channel_id);
                 if (channel) {
                     await channel.delete().catch(() => {});
-                    console.log(`Auto-closed old application #${app.id} on startup.`);
+                    console.log(`Auto-closed old application #${app.guild_app_number || app.id} on startup.`);
                 }
             }
         }
@@ -289,7 +305,7 @@ client.on('interactionCreate', async interaction => {
                 .addFields(
                     { name: '⚙️ Configuration & Setup', value: '`/dashboard` - Opens the step-by-step wizard to configure the bot.\n`/config` - Views the current bot configuration for this server.', inline: false },
                     { name: '✏️ Individual Editing', value: '`/edit_channels` - Updates the ticket category and logs channel.\n`/edit_rules` - Updates the application rules.\n`/edit_questions` - Updates the application questions.\n`/edit_roles` - Updates the staff roles that can review applications.\n`/edit_messages` - Updates the approval and denial messages.\n`/edit_panel` - Updates the panel description shown before applying.', inline: false },
-                    { name: '🛠️ Deployment & Management', value: '`/deploy` - Sends the application panel to the current channel.\n`/forceclose` - Force closes and deletes the current ticket channel.\n`/purge` - Bulk deletes all completed application channels without deleting database records.', inline: false },
+                    { name: '🛠️ Deployment & Management', value: '`/deploy` - Sends the application panel to the current channel.\n`/forceclose` - Force closes and deletes the current ticket channel.\n`/purge` - Deletes all completed application channels tracked in the database.\n`/reset` - Clears a stuck application for a specific user.', inline: false },
                     { name: '❓ Utility', value: '`/help` - Shows this help menu.', inline: false }
                 )
                 .setFooter({ text: 'FVRRP Applications Bot', iconURL: client.user.displayAvatarURL() });
@@ -312,7 +328,14 @@ client.on('interactionCreate', async interaction => {
             const channelId = interaction.channel.id;
             
             db.get(`SELECT * FROM applications WHERE channel_id = ?`, [channelId], async (err, row) => {
-                if (row && row.status === 'PENDING') {
+                if (err || !row) {
+                    return interaction.reply({ 
+                        content: '❌ **Error:** This is not an application channel. I cannot force close it.', 
+                        flags: MessageFlags.Ephemeral 
+                    });
+                }
+
+                if (row.status === 'PENDING') {
                     db.run(`DELETE FROM applications WHERE channel_id = ?`, [channelId]);
                     await interaction.reply({ content: 'Force closing channel and clearing pending application data in 3 seconds...', flags: MessageFlags.Ephemeral });
                 } else {
@@ -324,7 +347,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         // ==========================================
-        // /PURGE COMMAND
+        // /PURGE COMMAND (Re-deployed: DB Only)
         // ==========================================
         if (interaction.isChatInputCommand() && interaction.commandName === 'purge') {
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -342,7 +365,35 @@ client.on('interactionCreate', async interaction => {
                         }
                     }
                 }
-                return interaction.editReply({ content: `✅ Successfully purged **${count}** completed application channels. Database records have been kept intact.` });
+                return interaction.editReply({ content: `✅ Successfully purged **${count}** completed application channels created by the bot. Database records have been kept intact.` });
+            });
+            return;
+        }
+
+        // ==========================================
+        // /RESET COMMAND
+        // ==========================================
+        if (interaction.isChatInputCommand() && interaction.commandName === 'reset') {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const targetUser = interaction.options.getUser('user');
+
+            db.get(`SELECT * FROM applications WHERE user_id = ? AND guild_id = ? AND status = 'PENDING'`, [targetUser.id, interaction.guild.id], async (err, row) => {
+                if (err || !row) {
+                    return interaction.editReply({ content: `❌ No pending application found for <@${targetUser.id}>.` });
+                }
+
+                // Delete the database record so they can reapply
+                db.run(`DELETE FROM applications WHERE id = ?`, [row.id]);
+
+                // Try to delete the channel if it still exists
+                if (row.channel_id) {
+                    const channel = interaction.guild.channels.cache.get(row.channel_id);
+                    if (channel) {
+                        await channel.delete().catch(() => {});
+                    }
+                }
+
+                return interaction.editReply({ content: `✅ Successfully reset the pending application for <@${targetUser.id}>. They can now apply again.` });
             });
             return;
         }
@@ -517,10 +568,21 @@ client.on('interactionCreate', async interaction => {
                 
                 if (!isStaff(member, settings)) return interaction.reply({ content: 'Only staff can archive applications.', flags: MessageFlags.Ephemeral });
 
-                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
                 const logChannel = interaction.guild.channels.cache.get(settings.log_channel_id);
-                if (!logChannel) return interaction.editReply({ content: 'Log channel not found.' });
+                if (!logChannel) {
+                    return interaction.reply({ content: '❌ The logs channel set in the configuration no longer exists. Please update it using `/edit_channels`.', flags: MessageFlags.Ephemeral });
+                }
 
+                const botMember = interaction.guild.members.me;
+                if (!logChannel.permissionsFor(botMember)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+                    return interaction.reply({ 
+                        content: `❌ **Missing Access:** I do not have permission to view or send messages in the logs channel (<#${logChannel.id}>). Please check my permissions and try again.`, 
+                        flags: MessageFlags.Ephemeral 
+                    });
+                }
+
+                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+                
                 const messages = await interaction.channel.messages.fetch({ limit: 100 });
                 const sortedMessages = Array.from(messages.values()).reverse();
                 
@@ -624,14 +686,15 @@ client.on('interactionCreate', async interaction => {
                 const applicationId = interaction.customId.split('_')[1];
                 const reason = interaction.fields.getTextInputValue('reason');
                 const application = await getApplication(applicationId);
+                const appNumber = application.guild_app_number || application.id;
 
                 if (application.status === 'APPROVED' || application.status === 'DENIED') return interaction.reply({ content: '❌ This application has already been reviewed.', flags: MessageFlags.Ephemeral });
 
                 const now = Date.now();
                 db.run(`UPDATE applications SET status='DENIED', reviewer_id=?, denial_reason=?, reviewed_at=? WHERE id=?`, [interaction.user.id, reason, now, applicationId]);
-                await interaction.channel.setName(`🔴-denied-${String(applicationId).padStart(4,'0')}`);
+                await interaction.channel.setName(`🔴-denied-${String(appNumber).padStart(4,'0')}`);
                 
-                logTranscript(interaction.guild, settings, applicationId, application.user_id, interaction.user.id, 'DENIED', reason);
+                logTranscript(interaction.guild, settings, appNumber, application.user_id, interaction.user.id, 'DENIED', reason);
 
                 const denialEmbed = new EmbedBuilder()
                     .setColor('#ED4245')
@@ -661,76 +724,81 @@ client.on('interactionCreate', async interaction => {
             const activeApp = await getActiveApplication(interaction.user.id, interaction.guild.id);
             if (activeApp) return interaction.reply({ content: '❌ You already have an open application in this server. Please wait for it to be reviewed before submitting another.', flags: MessageFlags.Ephemeral });
 
-            db.run(`INSERT INTO applications (user_id, guild_id, status) VALUES (?, ?, 'PENDING')`, [interaction.user.id, interaction.guild.id], async function () {
-                const applicationId = this.lastID;
-                const userId = interaction.member?.id || interaction.user.id;
-                const everyoneRoleId = interaction.guild?.roles?.everyone?.id || interaction.guild.id; 
+            db.get(`SELECT MAX(guild_app_number) as max_num FROM applications WHERE guild_id = ?`, [interaction.guild.id], (err, row) => {
+                const nextNum = (row && row.max_num ? row.max_num : 0) + 1;
 
-                let channel;
-                try {
-                    channel = await interaction.guild.channels.create({
-                        name: `🟡-application-${String(applicationId).padStart(4, '0')}`,
-                        type: ChannelType.GuildText,
-                        parent: settings.category_id,
-                        permissionOverwrites: [
-                            { id: everyoneRoleId, deny: [PermissionFlagsBits.ViewChannel] },
-                            { id: userId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
-                            { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] },
-                            ...JSON.parse(settings.staff_roles || '[]').map(roleId => ({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }))
-                        ]
-                    });
-                } catch (e) {
-                    console.error("Failed to create channel:", e);
-                    db.run(`DELETE FROM applications WHERE id = ?`, [applicationId]);
-                    return interaction.reply({ content: `❌ **Failed to create channel.**\n\n**Diagnosis:** I do not have the necessary permissions to create a ticket channel. Please ensure I have the \`Manage Channels\` permission.\n\n**What to do:** Please go to the main FVRRP server and submit a ticket with this error screenshotted.`, flags: MessageFlags.Ephemeral });
-                }
+                db.run(`INSERT INTO applications (user_id, guild_id, status, guild_app_number) VALUES (?, ?, 'PENDING', ?)`, [interaction.user.id, interaction.guild.id, nextNum], async function () {
+                    const applicationId = this.lastID;
+                    
+                    const userId = interaction.member?.id || interaction.user.id;
+                    const everyoneRoleId = interaction.guild?.roles?.everyone?.id || interaction.guild.id; 
 
-                db.run(`UPDATE applications SET channel_id=? WHERE id=?`, [channel.id, applicationId]);
-
-                const failsafeTimeout = setTimeout(async () => {
+                    let channel;
                     try {
-                        const fetched = await channel.messages.fetch({ limit: 5 });
-                        if (fetched.size === 0) {
+                        channel = await interaction.guild.channels.create({
+                            name: `🟡-application-${String(nextNum).padStart(4, '0')}`,
+                            type: ChannelType.GuildText,
+                            parent: settings.category_id,
+                            permissionOverwrites: [
+                                { id: everyoneRoleId, deny: [PermissionFlagsBits.ViewChannel] },
+                                { id: userId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
+                                { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] },
+                                ...JSON.parse(settings.staff_roles || '[]').map(roleId => ({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }))
+                            ]
+                        });
+                    } catch (e) {
+                        console.error("Failed to create channel:", e);
+                        db.run(`DELETE FROM applications WHERE id = ?`, [applicationId]);
+                        return interaction.reply({ content: `❌ **Failed to create channel.**\n\n**Diagnosis:** I do not have the necessary permissions to create a ticket channel. Please ensure I have the \`Manage Channels\` permission.\n\n**What to do:** Please go to the main FVRRP server and submit a ticket with this error screenshotted.`, flags: MessageFlags.Ephemeral });
+                    }
+
+                    db.run(`UPDATE applications SET channel_id=? WHERE id=?`, [channel.id, applicationId]);
+
+                    const failsafeTimeout = setTimeout(async () => {
+                        try {
+                            const fetched = await channel.messages.fetch({ limit: 5 });
+                            if (fetched.size === 0) {
+                                db.run(`DELETE FROM applications WHERE id = ?`, [applicationId]);
+                                await channel.delete().catch(() => {});
+                                console.log(`Failsafe triggered: Deleted channel ${channel.name} and cleared DB record.`);
+                                if (settings.log_channel_id) {
+                                    const logChannel = interaction.guild.channels.cache.get(settings.log_channel_id);
+                                    if (logChannel) sendDiagnosticError(logChannel, "The bot failed to send the initial application embed within 10 seconds. The channel has been automatically deleted to prevent ghost tickets. The applicant's DB record was cleared so they can reapply.");
+                                }
+                            }
+                        } catch (e) {
                             db.run(`DELETE FROM applications WHERE id = ?`, [applicationId]);
                             await channel.delete().catch(() => {});
-                            console.log(`Failsafe triggered: Deleted channel ${channel.name} and cleared DB record.`);
-                            if (settings.log_channel_id) {
-                                const logChannel = interaction.guild.channels.cache.get(settings.log_channel_id);
-                                if (logChannel) sendDiagnosticError(logChannel, "The bot failed to send the initial application embed within 10 seconds. The channel has been automatically deleted to prevent ghost tickets. The applicant's DB record was cleared so they can reapply.");
-                            }
                         }
+                    }, 10000); 
+
+                    const mergedEmbed = new EmbedBuilder()
+                        .setColor('#FEE75C')
+                        .setTitle('📝 Application Received')
+                        .setDescription(`Thank you for applying, <@${interaction.user.id}>.\n\n**📜 Application Rules:**\n${settings.application_rules || 'No rules provided.'}\n\n**Answer the Questions below as best you can:**\n${settings.application_questions || 'No questions provided.'}`)
+                        .setTimestamp();
+
+                    const applicantRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`close_${applicationId}`).setLabel('Close Application').setStyle(ButtonStyle.Danger));
+                    const staffRow = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`claim_${applicationId}`).setLabel('Claim').setStyle(ButtonStyle.Primary),
+                        new ButtonBuilder().setCustomId(`approve_${applicationId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+                        new ButtonBuilder().setCustomId(`deny_${applicationId}`).setLabel('Deny').setStyle(ButtonStyle.Danger)
+                    );
+
+                    try {
+                        await channel.send({ content: `<@${interaction.user.id}>`, embeds: [mergedEmbed] });
+                        await channel.send({ embeds: [new EmbedBuilder().setColor('#2b2d31').setTitle('🛡️ Staff Controls').setDescription('Use the buttons below to manage this application.')], components: [staffRow] });
+                        await channel.send({ components: [applicantRow] });
+                        clearTimeout(failsafeTimeout);
+                        await interaction.reply({ content: `✅ Application created: ${channel}`, flags: MessageFlags.Ephemeral });
                     } catch (e) {
+                        console.error("Failed to send messages in new channel:", e);
+                        clearTimeout(failsafeTimeout);
                         db.run(`DELETE FROM applications WHERE id = ?`, [applicationId]);
                         await channel.delete().catch(() => {});
+                        return interaction.reply({ content: `❌ **Failed to send messages in the ticket.**\n\n**Diagnosis:** I created the channel, but was immediately locked out of it. This usually happens if I lack the \`View Channel\` or \`Send Messages\` permissions, or if the category overrides my permissions.\n\n**What to do:** Please go to the main FVRRP server and submit a ticket with this error screenshotted.`, flags: MessageFlags.Ephemeral });
                     }
-                }, 10000); 
-
-                const mergedEmbed = new EmbedBuilder()
-                    .setColor('#FEE75C')
-                    .setTitle('📝 Application Received')
-                    .setDescription(`Thank you for applying, <@${interaction.user.id}>.\n\n**📜 Application Rules:**\n${settings.application_rules || 'No rules provided.'}\n\n**Answer the Questions below as best you can:**\n${settings.application_questions || 'No questions provided.'}`)
-                    .setTimestamp();
-
-                const applicantRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`close_${applicationId}`).setLabel('Close Application').setStyle(ButtonStyle.Danger));
-                const staffRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`claim_${applicationId}`).setLabel('Claim').setStyle(ButtonStyle.Primary),
-                    new ButtonBuilder().setCustomId(`approve_${applicationId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
-                    new ButtonBuilder().setCustomId(`deny_${applicationId}`).setLabel('Deny').setStyle(ButtonStyle.Danger)
-                );
-
-                try {
-                    await channel.send({ content: `<@${interaction.user.id}>`, embeds: [mergedEmbed] });
-                    await channel.send({ embeds: [new EmbedBuilder().setColor('#2b2d31').setTitle('🛡️ Staff Controls').setDescription('Use the buttons below to manage this application.')], components: [staffRow] });
-                    await channel.send({ components: [applicantRow] });
-                    clearTimeout(failsafeTimeout);
-                    await interaction.reply({ content: `✅ Application created: ${channel}`, flags: MessageFlags.Ephemeral });
-                } catch (e) {
-                    console.error("Failed to send messages in new channel:", e);
-                    clearTimeout(failsafeTimeout);
-                    db.run(`DELETE FROM applications WHERE id = ?`, [applicationId]);
-                    await channel.delete().catch(() => {});
-                    return interaction.reply({ content: `❌ **Failed to send messages in the ticket.**\n\n**Diagnosis:** I created the channel, but was immediately locked out of it. This usually happens if I lack the \`View Channel\` or \`Send Messages\` permissions, or if the category overrides my permissions.\n\n**What to do:** Please go to the main FVRRP server and submit a ticket with this error screenshotted.`, flags: MessageFlags.Ephemeral });
-                }
+                });
             });
             return;
         }
@@ -750,14 +818,15 @@ client.on('interactionCreate', async interaction => {
 
             const applicationId = interaction.customId.split('_')[1];
             const application = await getApplication(applicationId);
+            const appNumber = application.guild_app_number || application.id;
 
             if (application.status === 'APPROVED' || application.status === 'DENIED') return interaction.reply({ content: '❌ This application has already been reviewed.', flags: MessageFlags.Ephemeral });
 
             const now = Date.now();
             db.run(`UPDATE applications SET status='APPROVED', reviewer_id=?, reviewed_at=? WHERE id=?`, [interaction.user.id, now, applicationId]);
-            await interaction.channel.setName(`🟢-approved-${String(applicationId).padStart(4,'0')}`);
+            await interaction.channel.setName(`🟢-approved-${String(appNumber).padStart(4,'0')}`);
             
-            logTranscript(interaction.guild, settings, applicationId, application.user_id, interaction.user.id, 'APPROVED');
+            logTranscript(interaction.guild, settings, appNumber, application.user_id, interaction.user.id, 'APPROVED');
 
             const approvalEmbed = new EmbedBuilder()
                 .setColor('#57F287')
@@ -810,8 +879,12 @@ client.on('interactionCreate', async interaction => {
 
     } catch (error) {
         console.error(error);
-        if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-            interaction.reply({ content: 'An error occurred.', flags: MessageFlags.Ephemeral }).catch(() => {});
+        if (interaction.isRepliable()) {
+            if (!interaction.replied && !interaction.deferred) {
+                interaction.reply({ content: '❌ An error occurred.', flags: MessageFlags.Ephemeral }).catch(() => {});
+            } else if (interaction.deferred && !interaction.replied) {
+                interaction.editReply({ content: '❌ An unexpected error occurred while executing this action. Please check my permissions and try again.' }).catch(() => {});
+            }
         }
     }
 });
