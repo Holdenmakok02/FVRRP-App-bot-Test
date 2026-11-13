@@ -29,8 +29,6 @@ const client = new Client({
 // ==========================================
 // DATABASE SETUP (Railway Volume Fix)
 // ==========================================
-// IMPORTANT: If your config resets on Railway, it means your Volume is not mounted correctly.
-// Go to Railway -> Variables and add DB_PATH = /data/data.sqlite
 const dbPath = process.env.DB_PATH || './data.sqlite';
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) console.error('Error opening database:', err);
@@ -48,7 +46,8 @@ db.serialize(() => {
             application_questions TEXT,
             panel_message TEXT,
             approval_message TEXT,
-            denial_message TEXT
+            denial_message TEXT,
+            app_counter INTEGER DEFAULT 0
         )
     `);
 
@@ -84,6 +83,7 @@ db.serialize(() => {
     ensureColumn('settings', 'panel_message', 'TEXT');
     ensureColumn('settings', 'approval_message', 'TEXT');
     ensureColumn('settings', 'denial_message', 'TEXT');
+    ensureColumn('settings', 'app_counter', 'INTEGER DEFAULT 0'); // <-- New permanent counter
     ensureColumn('applications', 'guild_id', 'TEXT');
     ensureColumn('applications', 'guild_app_number', 'INTEGER');
     ensureColumn('applications', 'reviewed_at', 'INTEGER');
@@ -341,14 +341,13 @@ client.on('interactionCreate', async interaction => {
         }
 
         // ==========================================
-        // /FORCECLOSE COMMAND (Now handles orphaned channels)
+        // /FORCECLOSE COMMAND
         // ==========================================
         if (interaction.isChatInputCommand() && interaction.commandName === 'forceclose') {
             const channelId = interaction.channel.id;
             const settings = await getSettings(interaction.guild.id);
             
             db.get(`SELECT * FROM applications WHERE channel_id = ?`, [channelId], async (err, row) => {
-                // If it's in the DB, handle normally
                 if (row) {
                     if (row.status === 'PENDING') {
                         db.run(`DELETE FROM applications WHERE channel_id = ?`, [channelId]);
@@ -360,14 +359,12 @@ client.on('interactionCreate', async interaction => {
                     return;
                 }
 
-                // If it's NOT in the DB, but it's in the application category, it's an orphaned ticket. Delete it.
                 if (settings && settings.category_id && interaction.channel.parentId === settings.category_id) {
                     await interaction.reply({ content: 'Force closing orphaned application channel in 3 seconds...', flags: MessageFlags.Ephemeral });
                     setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
                     return;
                 }
 
-                // If it's not in the DB AND not in the category, refuse.
                 return interaction.reply({ 
                     content: '❌ **Error:** This is not an application channel. I cannot force close it.', 
                     flags: MessageFlags.Ephemeral 
@@ -760,13 +757,15 @@ client.on('interactionCreate', async interaction => {
             const activeApp = await getActiveApplication(interaction.user.id, interaction.guild.id);
             if (activeApp) return interaction.reply({ content: '❌ You already have an open application in this server. Please wait for it to be reviewed before submitting another.', flags: MessageFlags.Ephemeral });
 
+            // PERMANENT COUNTER LOGIC
+            // If app_counter is somehow lower than the highest existing app (e.g. migrating from old DB), we take the highest one.
             db.get(`SELECT MAX(guild_app_number) as max_num FROM applications WHERE guild_id = ?`, [interaction.guild.id], (err, row) => {
-                if (err) {
-                    console.error("Error getting max_num:", err);
-                    return interaction.reply({ content: '❌ Database error while calculating application number.', flags: MessageFlags.Ephemeral }).catch(()=>{});
-                }
+                const maxExistingNum = (row && row.max_num) ? row.max_num : 0;
+                const currentCounter = settings.app_counter || 0;
+                const nextNum = Math.max(maxExistingNum, currentCounter) + 1;
 
-                const nextNum = (row && row.max_num ? row.max_num : 0) + 1;
+                // Save the new counter back to the settings table so it survives forever
+                db.run(`UPDATE settings SET app_counter = ? WHERE guild_id = ?`, [nextNum, interaction.guild.id]);
 
                 db.run(`INSERT INTO applications (user_id, guild_id, status, guild_app_number) VALUES (?, ?, 'PENDING', ?)`, [interaction.user.id, interaction.guild.id, nextNum], async function (insertErr) {
                     if (insertErr) {
