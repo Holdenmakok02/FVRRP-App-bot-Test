@@ -29,6 +29,8 @@ const client = new Client({
 // ==========================================
 // DATABASE SETUP (Railway Volume Fix)
 // ==========================================
+// IMPORTANT: If your config resets on Railway, it means your Volume is not mounted correctly.
+// Go to Railway -> Variables and add DB_PATH = /data/data.sqlite
 const dbPath = process.env.DB_PATH || './data.sqlite';
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) console.error('Error opening database:', err);
@@ -78,13 +80,10 @@ db.serialize(() => {
         });
     };
 
-    // Check settings table
     ensureColumn('settings', 'application_questions', 'TEXT');
     ensureColumn('settings', 'panel_message', 'TEXT');
     ensureColumn('settings', 'approval_message', 'TEXT');
     ensureColumn('settings', 'denial_message', 'TEXT');
-    
-    // Check applications table
     ensureColumn('applications', 'guild_id', 'TEXT');
     ensureColumn('applications', 'guild_app_number', 'INTEGER');
     ensureColumn('applications', 'reviewed_at', 'INTEGER');
@@ -342,26 +341,37 @@ client.on('interactionCreate', async interaction => {
         }
 
         // ==========================================
-        // /FORCECLOSE COMMAND
+        // /FORCECLOSE COMMAND (Now handles orphaned channels)
         // ==========================================
         if (interaction.isChatInputCommand() && interaction.commandName === 'forceclose') {
             const channelId = interaction.channel.id;
+            const settings = await getSettings(interaction.guild.id);
             
             db.get(`SELECT * FROM applications WHERE channel_id = ?`, [channelId], async (err, row) => {
-                if (err || !row) {
-                    return interaction.reply({ 
-                        content: '❌ **Error:** This is not an application channel. I cannot force close it.', 
-                        flags: MessageFlags.Ephemeral 
-                    });
+                // If it's in the DB, handle normally
+                if (row) {
+                    if (row.status === 'PENDING') {
+                        db.run(`DELETE FROM applications WHERE channel_id = ?`, [channelId]);
+                        await interaction.reply({ content: 'Force closing channel and clearing pending application data in 3 seconds...', flags: MessageFlags.Ephemeral });
+                    } else {
+                        await interaction.reply({ content: 'Force closing completed application channel in 3 seconds... (Data retained)', flags: MessageFlags.Ephemeral });
+                    }
+                    setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
+                    return;
                 }
 
-                if (row.status === 'PENDING') {
-                    db.run(`DELETE FROM applications WHERE channel_id = ?`, [channelId]);
-                    await interaction.reply({ content: 'Force closing channel and clearing pending application data in 3 seconds...', flags: MessageFlags.Ephemeral });
-                } else {
-                    await interaction.reply({ content: 'Force closing completed application channel in 3 seconds... (Data retained)', flags: MessageFlags.Ephemeral });
+                // If it's NOT in the DB, but it's in the application category, it's an orphaned ticket. Delete it.
+                if (settings && settings.category_id && interaction.channel.parentId === settings.category_id) {
+                    await interaction.reply({ content: 'Force closing orphaned application channel in 3 seconds...', flags: MessageFlags.Ephemeral });
+                    setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
+                    return;
                 }
-                setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
+
+                // If it's not in the DB AND not in the category, refuse.
+                return interaction.reply({ 
+                    content: '❌ **Error:** This is not an application channel. I cannot force close it.', 
+                    flags: MessageFlags.Ephemeral 
+                });
             });
             return;
         }
@@ -399,7 +409,7 @@ client.on('interactionCreate', async interaction => {
 
             db.get(`SELECT * FROM applications WHERE user_id = ? AND guild_id = ? AND status = 'PENDING'`, [targetUser.id, interaction.guild.id], async (err, row) => {
                 if (err || !row) {
-                    return interaction.editReply({ content: `❌ No pending application found for <@${targetUser.id}>.` });
+                    return interaction.editReply({ content: `❌ No pending application found for <@${targetUser.id}> in the database.` });
                 }
 
                 db.run(`DELETE FROM applications WHERE id = ?`, [row.id]);
